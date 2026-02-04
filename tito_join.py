@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Set, Optional
+from typing import List, Tuple, Set, Optional, Union
 
 
 @dataclass(frozen=True)
 class PairRep:
     """
-    JOIN pair representation(may have star)
+    JOIN pair representation (may have star)
     - a: left side (group node id, 0..n-1)
-    - b: right side (imaginary index, eg. x+n, x+2n, ...)
-    - star: True 表示 (a,b)*
+    - b: right side (imaginary index, e.g. x, x+n, x+2n, ...)
+    - star: True means (a,b)*
     """
     a: int
     b: int
@@ -22,19 +22,21 @@ class PairRep:
 
 class InversionSet:
     """
-    inversion_set:
-      fields:
-        inversions: [(a,b), (c,d), ...]  
-        n: int                         
-
-    functions:
-      - convert_matrix(): adjacency matrix (n*n bool), adjacency list
-      - JOIN_matrix(): transitive closure matrix with '0'/'1'/'*'
-            '1' if reachable with path length>=1,
-            '*' on diagonal if i can reach itself with path length>=1 (cycle),
-            otherwise '0'
-      - compute_JOIN(): list all reachable pairs with special star rules and
-            imaginary-index lifting (so results match your desired format)
+    Inversion Set data structure
+    
+    There are n nodes, representing groups from 0 to n-1:
+    - node0 can represent 0, n, 2n, ...
+    - node1 can represent 1, n+1, 2n+1, ...
+    - and so on
+    
+    Fields:
+        inversions: [(a,b), (c,d), ...]  - inversion pairs
+        n: int - number of groups
+    
+    Class Functions:
+        - convert_matrix(): convert to n*n adjacency matrix, elements are lists of reachable imaginary indices
+        - JOIN_matrix(): convert to JOIN_graph, preserve all imaginary indices, mark cycles with '*'
+        - compute_JOIN(): list all reachable pairs, handle star special cases
     """
 
     def __init__(self, inversions: List[Tuple[int, int]], n: int):
@@ -44,33 +46,49 @@ class InversionSet:
         self.n = n
 
         # caches
-        self._adj_list: Optional[List[List[int]]] = None
-        self._adj_mat: Optional[List[List[bool]]] = None
-        self._join_mat: Optional[List[List[str]]] = None
-        self._reach: Optional[List[List[bool]]] = None  # reachability (len>=1)
-        self._star_nodes: Optional[Set[int]] = None     # nodes with reach[i][i]=True
+        self._adj_list: Optional[List[List[int]]] = None              # group-level adjacency list
+        self._adj_mat: Optional[List[List[List[int]]]] = None         # n*n matrix, elements are lists
+        self._join_mat: Optional[List[List[Union[List[int], str]]]] = None  # JOIN matrix (for display)
+        self._join_data: Optional[List[List[List[int]]]] = None       # JOIN data (preserves all imaginary indices)
+        self._star_nodes: Optional[Set[int]] = None                   # nodes with self-loops
 
-    # ---------------- Function 1 ----------------
-    def convert_matrix(self) -> List[List[bool]]:
+    # ---------------- Function 1: convert_matrix ----------------
+    def convert_matrix(self) -> List[List[List[int]]]:
         """
-        convert inversion_set to group-level adjacent graph/matrix
-        rule: each (a,b) generate edge (a mod n) -> (b mod n), or Matrix(a,b)=1
+        Convert inversion_set to n*n adjacency graph/matrix
+        
+        Conversion rules:
+        - For each pair (a, b) in inversions, left to right means reachable
+        - Matrix elements are arrays/lists, recording all reachable imaginary indices
+        
+        Example when n=2:
+        - (0,1): matrix[0][1] records 1
+        - (0,3): matrix[0][1] also records 3 (since 3 % 2 = 1)
+        - Final matrix[0][1] = [1, 3]
         """
         n = self.n
-        adj_mat = [[False] * n for _ in range(n)]
-        adj_list = [[] for _ in range(n)]
-
+        # Adjacency matrix, each element is a list recording all original imaginary indices
+        adj_mat: List[List[List[int]]] = [[[] for _ in range(n)] for _ in range(n)]
+        
         for a, b in self.inversions:
-            u = a % n
-            v = b % n
-            if not adj_mat[u][v]:
-                adj_mat[u][v] = True
-                adj_list[u].append(v)
-
+            u = a % n  # source group
+            v = b % n  # target group
+            # Record original imaginary index b
+            if b not in adj_mat[u][v]:
+                adj_mat[u][v].append(b)
+        
         self._adj_mat = adj_mat
+        
+        # Also build group-level adjacency list for graph algorithms
+        adj_list: List[List[int]] = [[] for _ in range(n)]
+        for u in range(n):
+            for v in range(n):
+                if adj_mat[u][v] and v not in adj_list[u]:
+                    adj_list[u].append(v)
+        
         self._adj_list = adj_list
 
-        # invalidate downstream caches
+        # Clear downstream caches
         self._join_mat = None
         self._reach = None
         self._star_nodes = None
@@ -78,127 +96,164 @@ class InversionSet:
         return adj_mat
 
     def _ensure_graph(self) -> None:
+        """Ensure adjacency matrix and adjacency list are built"""
         if self._adj_list is None or self._adj_mat is None:
             self.convert_matrix()
 
-    # ---------------- Reachability (len >= 1) ----------------
-    def _reachable_from_len_ge_1(self, s: int) -> Set[int]:
+    # ---------------- Function 2: JOIN_matrix ----------------
+    def JOIN_matrix(self) -> List[List[Union[List[int], str]]]:
         """
-        all reachable from s
-        """
-        self._ensure_graph()
-        g = self._adj_list
-        visited = [False] * self.n
-        stack = [s]
-
-        while stack:
-            v = stack.pop()
-            for w in g[v]:
-                if not visited[w]:
-                    visited[w] = True
-                    stack.append(w)
-
-        return {i for i, ok in enumerate(visited) if ok}
-
-    # ---------------- Function 2 ----------------
-    def JOIN_matrix(self) -> List[List[str]]:
-        """
-        output n*n JOIN_matrix:
-          - reachable (len>=1) => '1'
-          - diagonal reachable (cycle) => '*'
-          - otherwise => '0'
+        Convert adjacency matrix to JOIN_graph (transitive closure)
+        
+        Conversion rules:
+        - Preserve all reachable imaginary indices (no information loss)
+        - If a cycle exists (node can reach itself via a path), the node has a self-loop
+        - Mark '*' at diagonal position (i,i) to indicate self-loop
+        
+        Example n=2, inversions=[(0,1), (0,3), (1,2)]:
+        - convert_matrix: [[[], [1,3]], [[2], []]]
+        - JOIN_matrix: preserve all imaginary indices after transitive closure
+        - Mark '*' on diagonal when cycle exists
         """
         self._ensure_graph()
         n = self.n
 
-        reach = [[False] * n for _ in range(n)]
-        for i in range(n):
-            for j in self._reachable_from_len_ge_1(i):
-                reach[i][j] = True
+        # Initialize: copy adjacency matrix
+        join_data: List[List[List[int]]] = [[list(cell) for cell in row] for row in self._adj_mat]
 
-        join_mat = [["0"] * n for _ in range(n)]
+        # Floyd-Warshall transitive closure, preserve all imaginary indices
+        changed = True
+        while changed:
+            changed = False
+            for k in range(n):
+                for i in range(n):
+                    for j in range(n):
+                        # If i->k reachable and k->j reachable
+                        if join_data[i][k] and join_data[k][j]:
+                            # Add k->j imaginary indices to i->j
+                            for idx in join_data[k][j]:
+                                if idx not in join_data[i][j]:
+                                    join_data[i][j].append(idx)
+                                    changed = True
+
+        # Identify self-loop nodes
+        self._star_nodes = {i for i in range(n) if join_data[i][i]}
+        self._join_data = join_data
+
+        # Build display matrix: use '*' for diagonal self-loops
+        display_mat: List[List[Union[List[int], str]]] = []
         for i in range(n):
+            row: List[Union[List[int], str]] = []
             for j in range(n):
-                if reach[i][j]:
-                    join_mat[i][j] = "1"
-            if reach[i][i]:
-                join_mat[i][i] = "*"
+                if i == j and i in self._star_nodes:
+                    row.append('*')
+                else:
+                    row.append(join_data[i][j])
+            display_mat.append(row)
 
-        self._reach = reach
-        self._join_mat = join_mat
-        self._star_nodes = {i for i in range(n) if reach[i][i]}
+        self._join_mat = display_mat
+        return display_mat
 
-        return join_mat
-
-    # ---------------- Helper: lift b_group to imaginary index > a ----------------
-    def _lift_to_imaginary_gt_a(self, a: int, b_group: int) -> int:
-        """
-        b_group in [0..n-1]
-        return min imaginary index b' in the group, which satisfy b' > a
-          b' = b_group + k*n, k>=0, which b' > a
-        """
-        n = self.n
-        if b_group > a:
-            return b_group
-        k = ((a + 1) - b_group + n - 1) // n  # ceil((a+1-b)/n)
-        return b_group + k * n
-
-    # ---------------- Function 3 ----------------
+    # ---------------- Function 3: compute_JOIN ----------------
     def compute_JOIN(self) -> Set[PairRep]:
         """
-        - based on group-level reachability(len>=1)
-        - if object group b 是 star node(JOIN_matrix[b][b]=='*'), then (a, lifted_b)*
-        - don't output (a,a)* only follow special case 2 
-        - special case 2: for all star node x, (x, x+n)*
-
+        List all reachable pairs from JOIN_graph
+        
+        Special case handling:
+        1. If the right side (target) node x has matrix (x,x) = '*' (self-loop),
+           record as star representation.
+           (a,b)* represents the entire congruent class: (a,b), (a,b+n), (a,b+2n)...
+           So only keep the smallest imaginary index in the same group
+           
+        2. All nodes x with self-loops are additionally recorded as (x, x+n)*
+        
+        Returns:
+            JOIN - set of all reachable pairs after special case processing
         """
-        if self._reach is None or self._star_nodes is None:
+        if self._join_data is None or self._star_nodes is None:
             self.JOIN_matrix()
 
-        assert self._reach is not None
+        assert self._join_data is not None
         assert self._star_nodes is not None
 
-        reach = self._reach
+        join_data = self._join_data
         star_nodes = self._star_nodes
+        n = self.n
 
         join: Set[PairRep] = set()
 
-        # enumerate reachable pairs at group-level, then lift output
-        for a in range(self.n):
-            for b_group in range(self.n):
-                if not reach[a][b_group]:
+        for a in range(n):
+            for b_group in range(n):
+                if not join_data[a][b_group]:
                     continue
 
-                # 你期望的输出不包含 (a,a)*；自环交给 special case 2
+                # Skip (a, a) direct output, handled by special case 2
                 if b_group == a:
                     continue
 
-                b = self._lift_to_imaginary_gt_a(a, b_group)
-                join.add(PairRep(a, b, star=(b_group in star_nodes)))
+                if b_group in star_nodes:
+                    # Target group has star: (a,b)* covers entire congruent class
+                    # Only keep the smallest imaginary index
+                    b_min = min(join_data[a][b_group])
+                    join.add(PairRep(a, b_min, star=True))
+                else:
+                    # Target group has no star: keep all imaginary indices
+                    for b in join_data[a][b_group]:
+                        join.add(PairRep(a, b, star=False))
 
-        # special case 2: add (x, x+n)*
+        # Special case 2: all nodes x with self-loops are recorded as (x, x+n)*
         for x in star_nodes:
-            join.add(PairRep(x, x + self.n, star=True))
+            join.add(PairRep(x, x + n, star=True))
 
         return join
 
-
 # ------------------ Demo ------------------
 if __name__ == "__main__":
-    # Your example: n=2, inversions = [(0,1),(1,2)]
-    inv = InversionSet(inversions=[(0, 1), (1, 2), (2, 3)], n=3)
-
-    print("Adjacency matrix:")
-    A = inv.convert_matrix()
-    for row in A:
+    # Example 1: no cycle
+    print("n=2, inversions=[(0,1), (0,3)]")
+    inv = InversionSet(inversions=[(0, 1), (0, 3)], n=2)
+    
+    print("\nconvert_matrix:")
+    for row in inv.convert_matrix():
         print(row)
-
-    print("\nJOIN matrix (* on diagonal means in a cycle):")
-    Jm = inv.JOIN_matrix()
-    for row in Jm:
+    
+    print("\nJOIN_matrix:")
+    for row in inv.JOIN_matrix():
         print(row)
+    
+    print("\ncompute_JOIN:")
+    for p in sorted(inv.compute_JOIN(), key=lambda x: (x.a, x.b)):
+        print(p)
 
-    join = inv.compute_JOIN()
-    print("\nJOIN (formatted):")
-    for p in sorted(join, key=lambda x: (x.a, x.b, x.star)):
-        print(str(p))
+    # Example 2: with cycle
+    print("\n" + "=" * 30)
+    print("n=2, inversions=[(0,1), (0,3), (1,2)]")
+    inv2 = InversionSet(inversions=[(0, 1), (0, 3), (1, 2)], n=2)
+    
+    print("\nconvert_matrix:")
+    for row in inv2.convert_matrix():
+        print(row)
+    
+    print("\nJOIN_matrix:")
+    for row in inv2.JOIN_matrix():
+        print(row)
+    
+    print("\ncompute_JOIN:")
+    for p in sorted(inv2.compute_JOIN(), key=lambda x: (x.a, x.b)):
+        print(p)
+    
+    # Example 3
+    print("n=3, inversions=[(0,1), (1,2), (0,3)]")
+    inv = InversionSet(inversions=[(0, 1),(1, 2) ,(0, 3)], n=3)
+    
+    print("\nconvert_matrix:")
+    for row in inv.convert_matrix():
+        print(row)
+    
+    print("\nJOIN_matrix:")
+    for row in inv.JOIN_matrix():
+        print(row)
+    
+    print("\ncompute_JOIN:")
+    for p in sorted(inv.compute_JOIN(), key=lambda x: (x.a, x.b)):
+        print(p)
